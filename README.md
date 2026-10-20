@@ -44,6 +44,10 @@ defaults. Use `--tmpdir /path/on/tmpfs` to select a backing parent other than
   literal leading/trailing spaces or commas.
 - Moves and hard links between the memory and disk backends return `EXDEV`.
 - Unix socket endpoints must be created and accessed through the same view.
+- `getxattr` reports `security.capability` as absent (`ENODATA`) without querying
+  the backing filesystem. This workload does not use Linux file capabilities.
+  Other extended attributes, including user attributes, ACLs and SELinux
+  labels, retain their existing forwarding behavior.
 
 ## Isolation and cleanup
 
@@ -129,6 +133,8 @@ make bench
 python3 benchmarks/small_files.py --workers 16 --cycles 100 --samples 3
 # Optional comparison with a previously built helper:
 python3 benchmarks/small_files.py --baseline-binary /path/to/old/prefix-tmpfs
+# Small append writes, matching nginx debug/error-log traffic:
+python3 benchmarks/append_logs.py --baseline-binary /path/to/old/prefix-tmpfs
 ```
 
 The benchmark creates, writes, reads and recursively removes directories of
@@ -158,6 +164,22 @@ medians with other tests running on the same host:
 Four workers were about 2.45 times as fast as one in this workload. Eight
 workers gained only about 9% in elapsed time over four, while using about 67%
 more daemon CPU time. The default favors four as a throughput/CPU tradeoff.
+
+A short trace of an active nginx test run found 2,554 extended-attribute
+queries, all for `security.capability`, all returning `ENODATA`. No ACL or
+SELinux attribute queries appeared in that sample. The capability fast path
+avoids a backing-path lookup and `lgetxattr` call; it does not eliminate the
+FUSE request itself. Other attributes are not assumed to be absent.
+
+The append benchmark rotates native tmpfs, current FUSE and an optional older
+helper, using the same worker count and metadata cache settings for both FUSE
+versions. It measures independent clients repeatedly writing one small log
+line, verifies final file sizes, and excludes build, mount and cleanup time.
+With 16 clients, 10,000 writes/client, four workers and three samples, the
+capability fast path reduced median daemon CPU time from 3.620 to 2.980 seconds
+and elapsed time from 0.9231 to 0.7643 seconds on the measured host. Native
+tmpfs took 0.0157 seconds. These results identify remaining FUSE overhead;
+a saturated worker pool can still use approximately four CPU cores.
 
 These numbers describe this workload, not a general throughput guarantee.
 The mixed parallel create/read/delete stress probe also exposed an unresolved
