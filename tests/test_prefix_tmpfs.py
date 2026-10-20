@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -25,12 +26,24 @@ fs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fs)
 
 
+def churn_files(base, worker):
+    for cycle in range(30):
+        root = base / f"sandbox_{worker}_{cycle}"
+        root.mkdir()
+        for number in range(4):
+            path = root / str(number)
+            path.write_bytes(b"x" * 1024)
+            if path.read_bytes() != b"x" * 1024:
+                raise AssertionError("parallel readback mismatch")
+        shutil.rmtree(root)
+
+
 class PrefixConfiguration(unittest.TestCase):
     def test_cli_threading_configuration(self):
-        cases = ((None, [], True), ("1", [], True), ("0", [], False),
-                 ("0", ["--single-thread"], True),
-                 ("1", ["--multi-thread"], False),
-                 ("invalid", ["--single-thread"], True))
+        cases = ((None, [], 4), ("1", [], 1), ("0", [], 0),
+                 ("0", ["--single-thread"], 1),
+                 ("1", ["--multi-thread"], 0),
+                 ("invalid", ["--single-thread"], 1))
         for setting, options, expected in cases:
             with self.subTest(setting=setting, options=options), \
                     patch.dict(os.environ), \
@@ -39,19 +52,66 @@ class PrefixConfiguration(unittest.TestCase):
                                                "--", "true"]), \
                     patch.object(fs.signal, "signal"), \
                     patch.object(fs, "run", return_value=7) as run:
+                os.environ.pop("PREFIX_TMPFS_THREADS", None)
                 if setting is None:
                     os.environ.pop("PREFIX_TMPFS_SINGLE_THREAD", None)
                 else:
                     os.environ["PREFIX_TMPFS_SINGLE_THREAD"] = setting
                 self.assertEqual(fs.main(), 7)
-                self.assertIs(run.call_args.kwargs["single_thread"], expected)
+                self.assertEqual(run.call_args.kwargs["threads"], expected)
+
+    def test_worker_count_configuration_and_precedence(self):
+        cases = (({}, [], 4), ({"PREFIX_TMPFS_THREADS": "2"}, [], 2),
+                 ({"PREFIX_TMPFS_THREADS": "64"}, [], 64),
+                 ({"PREFIX_TMPFS_THREADS": "0"}, [], 0),
+                 ({"PREFIX_TMPFS_THREADS": "2", "PREFIX_TMPFS_SINGLE_THREAD": "1"}, [], 2),
+                 ({"PREFIX_TMPFS_THREADS": "bad"}, ["--threads", "8"], 8),
+                 ({"PREFIX_TMPFS_THREADS": "bad"}, ["--single-thread"], 1),
+                 ({"PREFIX_TMPFS_THREADS": "bad"}, ["--multi-thread"], 0))
+        for settings, options, expected in cases:
+            with self.subTest(settings=settings, options=options), \
+                    patch.dict(os.environ), \
+                    patch.object(sys, "argv", [str(SCRIPT), "--source", "/tmp", "--prefix",
+                                               "tmp_", *options, "--", "true"]), \
+                    patch.object(fs.signal, "signal"), \
+                    patch.object(fs, "run", return_value=7) as run:
+                os.environ.pop("PREFIX_TMPFS_THREADS", None)
+                os.environ.pop("PREFIX_TMPFS_SINGLE_THREAD", None)
+                os.environ.update(settings)
+                self.assertEqual(fs.main(), 7)
+                self.assertEqual(run.call_args.kwargs["threads"], expected)
+
+    def test_worker_count_validation(self):
+        for value in (None, -1, 65, "", "bad", "1.5", 1.5, True, "9" * 100):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "threads must be"):
+                    fs.validate_threads(value)
+        self.assertEqual(fs.resolve_threads(), 4)
+        self.assertEqual(fs.resolve_threads(single_thread=True), 1)
+        self.assertEqual(fs.resolve_threads(single_thread=False), 0)
+        with self.assertRaisesRegex(ValueError, "cannot both"):
+            fs.resolve_threads(threads=4, single_thread=True)
+
+    def test_cli_rejects_invalid_worker_counts(self):
+        for value in ("-1", "65", "bad", "1.5", ""):
+            for options, settings in ((["--threads", value], {}),
+                                      ([], {"PREFIX_TMPFS_THREADS": value})):
+                with self.subTest(value=value, options=options):
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), "--source", "/tmp", "--prefix", "tmp_",
+                         *options, "--", "true"], env={**os.environ, **settings},
+                        text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("threads must be an integer", result.stderr)
 
     def test_invalid_threading_configuration_does_not_run_command(self):
         for value in ("", "2", "false", "bad"):
             with self.subTest(value=value):
                 result = subprocess.run(
                     [sys.executable, str(SCRIPT), "--source", "/tmp", "--prefix", "tmp_",
-                     "--", "true"], env={**os.environ, "PREFIX_TMPFS_SINGLE_THREAD": value},
+                    "--", "true"], env={name: setting for name, setting in
+                                        {**os.environ, "PREFIX_TMPFS_SINGLE_THREAD": value}.items()
+                                        if name != "PREFIX_TMPFS_THREADS"},
                     text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("PREFIX_TMPFS_SINGLE_THREAD must be 0 or 1", result.stderr)
@@ -508,9 +568,18 @@ for name in ('cache_run', 'scratch_run', 'sandbox_run'):
         path.unlink()
 
     def test_parallel_independent_roots(self):
-        for single_thread in (True, False):
-            with self.subTest(single_thread=single_thread):
-                mount = self.custom_mount(["sandbox"], single_thread=single_thread)
+        for count in (1, 2, 4, 8, 0):
+            with self.subTest(threads=count):
+                mount = self.custom_mount(["sandbox"], threads=count)
+                tasks = Path(f"/proc/{mount.daemon.pid}/task")
+                expected = 1 if count == 1 else count + 1
+                before = set(tasks.iterdir())
+                if count:
+                    deadline = time.monotonic() + 2
+                    while len(before) != expected and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                        before = set(tasks.iterdir())
+                    self.assertEqual(len(before), expected)
 
                 def worker(index):
                     root = mount.view / ("sandbox_" + str(index))
@@ -524,14 +593,87 @@ for name in ('cache_run', 'scratch_run', 'sandbox_run'):
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                     list(pool.map(worker, range(16)))
-                threads = len(list(Path(f"/proc/{mount.daemon.pid}/task").iterdir()))
-                if single_thread:
-                    self.assertEqual(threads, 1)
+                after = set(tasks.iterdir())
+                if count:
+                    self.assertEqual(after, before)
                 else:
-                    self.assertGreater(threads, 1)
+                    self.assertGreater(len(after), 1)
                 self.assertEqual(list(mount.memory.iterdir()), [])
         self.assertEqual(list(self.memory.iterdir()), [])
         self.assertEqual(list(self.source.iterdir()), [])
+
+    def test_idle_fixed_pool_terminates_and_unmounts(self):
+        for count in (2, 4):
+            with self.subTest(threads=count):
+                mount = self.custom_mount(["sandbox"], threads=count)
+                (mount.view / "ordinary-marker").write_text("preserve")
+                mount.daemon.terminate()
+                mount.daemon.wait(timeout=5)
+                self.assertFalse(fs.is_mounted(mount.view))
+                self.assertEqual((self.source / "ordinary-marker").read_text(), "preserve")
+
+    def test_fixed_pool_mixed_operations_from_independent_processes(self):
+        with concurrent.futures.ProcessPoolExecutor(max_workers=8) as pool:
+            jobs = [pool.submit(churn_files, self.view, worker) for worker in range(16)]
+            for job in jobs:
+                job.result(timeout=15)
+        self.assertEqual(list(self.memory.iterdir()), [])
+        self.assertEqual(list(self.source.iterdir()), [])
+
+    def test_close_terminates_daemon_that_does_not_exit_after_unmount(self):
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"])
+        self.addCleanup(mount.close)
+        mount.daemon = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        mount.close()
+        self.assertLess(mount.daemon.returncode, 0)
+        self.assertFalse(mount.base.exists())
+
+    def test_native_helper_rejects_invalid_worker_counts(self):
+        for count in ("-1", "65", "bad", "1.5", "", "-18446744073709551615"):
+            with self.subTest(threads=count):
+                result = subprocess.run(
+                    [str(self.binary), "--prefix", "sandbox", "--threads", count,
+                     str(self.source), str(self.memory), str(self.mount.base / "unused")],
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("invalid worker count", result.stderr)
+
+    def test_partial_worker_start_failure_unmounts_and_stops_workers(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("requires a C compiler for pthread fault injection")
+        source = self.mount.base / "fail-thread.c"
+        library = self.mount.base / "fail-thread.so"
+        source.write_text('''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <pthread.h>
+static int calls;
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start)(void *), void *arg) {
+    int (*real_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    if (++calls == 2) return EAGAIN;
+    real_create = dlsym(RTLD_NEXT, "pthread_create");
+    return real_create(thread, attr, start, arg);
+}
+''')
+        subprocess.run([compiler, "-shared", "-fPIC", str(source), "-o", str(library),
+                        "-ldl", "-pthread"], check=True, capture_output=True, timeout=10)
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"], threads=4)
+        self.addCleanup(mount.close)
+        (self.source / "original-marker").write_text("preserve")
+        mount.daemon = subprocess.Popen(
+            [str(self.binary), "--prefix", "sandbox", "--threads", "4", str(self.source),
+             str(mount.memory), str(mount.view), "-f"],
+            env={**fs.infrastructure_env(), "LD_PRELOAD": str(library)},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(mount.daemon.stdout.close)
+        self.addCleanup(mount.daemon.stderr.close)
+        output, errors = mount.daemon.communicate(timeout=5)
+        self.assertEqual(mount.daemon.returncode, 1, (output, errors))
+        self.assertIn(b"FUSE request workers failed:", errors)
+        self.assertFalse(fs.is_mounted(mount.view))
+        self.assertEqual((self.source / "original-marker").read_text(), "preserve")
 
     def test_namespace_preserves_paths_identity_and_disk_writes(self):
         code = '''import os, sys
@@ -570,7 +712,7 @@ sys.exit(7)
                             prefixes=["sandbox"])
         self.assertEqual(status, 7)
         self.assertFalse(fs.is_mounted(mount.view))
-        self.assertIsNotNone(mount.daemon.poll())
+        self.assertEqual(mount.daemon.returncode, 0)
         self.assertEqual((mount.memory / "sandbox_failed/logs/error.log").read_text(),
                          "failure diagnostics")
         self.assertTrue(mount.log.is_file())
@@ -594,7 +736,7 @@ root.mkdir()
                             prefixes=["sandbox"])
         self.assertEqual(status, 0)
         self.assertFalse(fs.is_mounted(mount.view))
-        self.assertIsNotNone(mount.daemon.poll())
+        self.assertEqual(mount.daemon.returncode, 0)
         self.assertFalse(mount.base.exists())
         self.assertNotIn("retained diagnostics", errors.getvalue())
 

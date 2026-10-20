@@ -73,24 +73,32 @@ system enables it; this tool does not change the system's swap policy.
 
 ## Performance
 
-The launcher defaults to a single FUSE request thread. Parallel small-file
-workloads can otherwise spend more CPU scheduling libfuse workers and
-contending on their shared request queue than performing tmpfs operations.
-Wrapped commands still run in parallel; only filesystem request handling is
-serialized. This limits the daemon to approximately one CPU core, but does
-not limit the CPU used by the wrapped commands or the rest of the kernel.
-Requests involving slow or blocking backing files can hold up other requests
-in this mode. For those workloads, select the dynamic worker pool with
-`--multi-thread` or `PREFIX_TMPFS_SINGLE_THREAD=0`:
+The launcher defaults to four persistent FUSE request workers. This allows
+parallel requests without libfuse's dynamic worker creation/destruction costs.
+Workers reuse their request buffers, and the worker count stays fixed as load
+changes. An idle coordinator waits for shutdown, so a four-worker daemon
+normally has five OS threads. This uses the public session API and works with
+FUSE 3.10; no newer libfuse thread-limit API is required.
+
+Set `PREFIX_TMPFS_THREADS` or `--threads` to a count from `1` to `64`:
 
 ```sh
-PREFIX_TMPFS_SINGLE_THREAD=0 python3 prefix_tmpfs.py \
+PREFIX_TMPFS_THREADS=4 python3 prefix_tmpfs.py \
     --source /path/to/tests --prefix cache_ -- command args
 ```
 
-`--single-thread` and `--multi-thread` override the environment. The environment
-accepts only `0` or `1`, and defaults to `1`. Python callers can select the pool
-with `single_thread=False` in `PrefixMount` or `run`.
+A count of `1` selects the single-thread loop; `0` selects libfuse's original
+dynamic pool. `--single-thread` and `--multi-thread` are aliases for those two
+counts. All three command-line options override environment settings.
+`PREFIX_TMPFS_THREADS` takes precedence over the older
+`PREFIX_TMPFS_SINGLE_THREAD` variable (`1` means one thread; `0` means dynamic).
+With neither variable set, the default is four workers.
+
+Python callers can pass `threads=4` to `PrefixMount` or `run`. The older
+`single_thread=True/False` arguments remain supported for single/dynamic mode;
+specifying both `threads` and `single_thread` is an error. Wrapped commands
+continue to run in parallel in every mode. Slow or blocking backing-file
+operations still occupy a worker; a thread count is not a CPU quota.
 
 By default, positive lookups and attributes are cached for one second to
 reduce repeated path lookups for small files. Ordinary directories are
@@ -117,7 +125,7 @@ Measure on the filesystem used by your project:
 
 ```sh
 make bench
-# Compare single-thread and multi-thread CPU costs under parallel load:
+# Compare fixed 1/2/4/8-worker and dynamic pools under parallel load:
 python3 benchmarks/small_files.py --workers 16 --cycles 100 --samples 3
 # Optional comparison with a previously built helper:
 python3 benchmarks/small_files.py --baseline-binary /path/to/old/prefix-tmpfs
@@ -141,14 +149,25 @@ medians with other tests running on the same host:
 
 | Request handling (cache = 1 second) | Elapsed seconds | Daemon CPU seconds | Average daemon CPU |
 | --- | ---: | ---: | ---: |
-| Single thread | 1.4754 | 1.450 | 98% |
-| Dynamic worker pool | 3.8602 | 11.150 | 289% |
+| Single thread | 1.2825 | 1.270 | 99% |
+| Two fixed workers | 0.8207 | 1.580 | 194% |
+| Four fixed workers (default) | 0.5224 | 1.950 | 372% |
+| Eight fixed workers | 0.4776 | 3.260 | 683% |
+| Dynamic worker pool | 2.2930 | 7.830 | 341% |
+
+Four workers were about 2.45 times as fast as one in this workload. Eight
+workers gained only about 9% in elapsed time over four, while using about 67%
+more daemon CPU time. The default favors four as a throughput/CPU tradeoff.
 
 These numbers describe this workload, not a general throughput guarantee.
 The mixed parallel create/read/delete stress probe also exposed an unresolved
 cleanup race in the dynamic worker pool: `.fuse_hidden` files sometimes remain
 and cause `rmdir` to return `ENOTEMPTY`. The phased benchmark avoids overlapping
 close and unlink; it does not demonstrate that this cleanup race is fixed.
+A separate 16-process mixed create/read/delete probe completed three rounds
+with four fixed workers, checking 24,000 files, without encountering this
+failure. This is coverage of the bounded mode, not proof that the original
+dynamic pool's cleanup race is fixed.
 
 An earlier local run using the dynamic worker pool on Linux 5.14 / libfuse
 3.10.2, with one client, 200 directories, five 1 KiB files per directory and

@@ -4,11 +4,15 @@
 #define FUSE_USE_VERSION 31
 
 #include <fuse.h>
+#include <fuse_lowlevel.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,6 +36,9 @@ struct prefix {
 static const struct prefix *prefixes;
 static size_t prefix_count;
 static double cache_timeout;
+static unsigned int worker_count;
+
+#define MAX_WORKERS 64
 
 struct entry {
     char *name;
@@ -733,6 +740,190 @@ static const struct fuse_operations operations = {
     .flock = sfs_flock,
 };
 
+struct worker {
+    struct fuse_session *session;
+    struct fuse_buf buffer;
+    pthread_t thread;
+    int notify_fd;
+    int result;
+};
+
+static void
+free_worker_buffer(void *data)
+{
+    struct worker *worker = data;
+    free(worker->buffer.mem);
+}
+
+static void *
+serve_requests(void *data)
+{
+    struct worker *worker = data;
+    int result;
+    char finished = 1;
+
+    /* Cancellation is safe while waiting for requests, never while a
+     * callback or libfuse holds a lock. Each worker reuses its buffer. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(free_worker_buffer, worker);
+    while (!fuse_session_exited(worker->session)) {
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+        result = fuse_session_receive_buf(worker->session, &worker->buffer);
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+        if (result == -EINTR) {
+            continue;
+        }
+
+        if (result <= 0) {
+            worker->result = result;
+            break;
+        }
+
+        fuse_session_process_buf(worker->session, &worker->buffer);
+    }
+
+    fuse_session_exit(worker->session);
+    /* There are at most MAX_WORKERS notifications, so the nonblocking
+     * pipe cannot fill. Wake the coordinator on EOF or receive failure. */
+    (void) write(worker->notify_fd, &finished, sizeof(finished));
+    pthread_cleanup_pop(1);
+    return NULL;
+}
+
+static int
+fixed_loop(struct fuse_session *session, unsigned int count)
+{
+    struct worker workers[MAX_WORKERS] = {0};
+    struct pollfd wake;
+    sigset_t blocked, previous;
+    unsigned int created = 0, i;
+    int notifications[2], error, result = 0;
+
+    if (pipe2(notifications, O_CLOEXEC | O_NONBLOCK) == -1) {
+        return -errno;
+    }
+
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    sigaddset(&blocked, SIGHUP);
+    sigaddset(&blocked, SIGQUIT);
+    error = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+    if (error != 0) {
+        result = -error;
+        goto done;
+    }
+
+    for (i = 0; i < count; i++) {
+        workers[i].session = session;
+        workers[i].notify_fd = notifications[1];
+        error = pthread_create(&workers[i].thread, NULL, serve_requests, &workers[i]);
+        if (error != 0) {
+            result = -error;
+            break;
+        }
+
+        created++;
+    }
+
+    wake.fd = notifications[0];
+    wake.events = POLLIN;
+    while (result == 0 && !fuse_session_exited(session)) {
+        /* Atomically unblock termination signals while waiting. A plain
+         * poll could miss a signal between checking exited and sleeping. */
+        if (ppoll(&wake, 1, NULL, &previous) >= 0) {
+            break;
+        }
+
+        if (errno != EINTR) {
+            result = -errno;
+        }
+    }
+
+    fuse_session_exit(session);
+    for (i = 0; i < created; i++) {
+        pthread_cancel(workers[i].thread);
+    }
+
+    for (i = 0; i < created; i++) {
+        pthread_join(workers[i].thread, NULL);
+        if (workers[i].result < 0) {
+            result = workers[i].result;
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
+
+done:
+    close(notifications[0]);
+    close(notifications[1]);
+    return result;
+}
+
+static int
+bounded_main(int argc, char **argv)
+{
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_cmdline_opts options;
+    struct fuse *fuse;
+    struct fuse_session *session;
+    int result = 1;
+
+    if (fuse_parse_cmdline(&args, &options) != 0) {
+        fuse_opt_free_args(&args);
+        free(options.mountpoint);
+        return 1;
+    }
+
+    if (options.show_help || options.show_version) {
+        /* Preserve libfuse's help/version behavior for native callers. */
+        result = fuse_main(argc, argv, &operations, NULL);
+        goto free_args;
+    }
+
+    if (options.mountpoint == NULL) {
+        fprintf(stderr, "a mountpoint is required\n");
+        goto free_args;
+    }
+
+    fuse = fuse_new(&args, &operations, sizeof(operations), NULL);
+    if (fuse == NULL) {
+        goto free_args;
+    }
+
+    if (fuse_mount(fuse, options.mountpoint) != 0) {
+        goto destroy;
+    }
+
+    if (fuse_daemonize(options.foreground) != 0) {
+        goto unmount;
+    }
+
+    session = fuse_get_session(fuse);
+    if (fuse_set_signal_handlers(session) != 0) {
+        goto unmount;
+    }
+
+    if (worker_count == 1 || options.singlethread) {
+        result = fuse_loop(fuse);
+    } else if (fuse_start_cleanup_thread(fuse) == 0) {
+        result = fixed_loop(session, worker_count);
+        fuse_stop_cleanup_thread(fuse);
+        if (result < 0) {
+            fprintf(stderr, "FUSE request workers failed: %s\n", strerror(-result));
+        }
+    }
+
+    fuse_remove_signal_handlers(session);
+unmount:
+    fuse_unmount(fuse);
+destroy:
+    fuse_destroy(fuse);
+free_args:
+    free(options.mountpoint);
+    fuse_opt_free_args(&args);
+    return result != 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -747,6 +938,7 @@ main(int argc, char **argv)
 
     if (argc < 4) {
         fprintf(stderr, "usage: %s [--prefix NAME]... [--cache-timeout SECONDS] "
+                "[--threads 0..64] "
                 "SOURCE TMPFS MOUNTPOINT "
                 "[FUSE options]\n", argv[0]);
         return 2;
@@ -759,7 +951,8 @@ main(int argc, char **argv)
     }
 
     while (first < argc && (strcmp(argv[first], "--prefix") == 0
-                           || strcmp(argv[first], "--cache-timeout") == 0))
+                           || strcmp(argv[first], "--cache-timeout") == 0
+                           || strcmp(argv[first], "--threads") == 0))
     {
         if (first + 1 == argc) {
             fprintf(stderr, "%s requires a value\n", argv[first]);
@@ -767,6 +960,22 @@ main(int argc, char **argv)
         }
 
         value = argv[first + 1];
+        if (strcmp(argv[first], "--threads") == 0) {
+            long parsed;
+            errno = 0;
+            parsed = strtol(value, &end, 10);
+            if (end == value || *end != '\0' || errno != 0
+                || parsed < 0 || parsed > MAX_WORKERS)
+            {
+                fprintf(stderr, "invalid worker count: %s\n", value);
+                goto done;
+            }
+
+            worker_count = (unsigned int) parsed;
+            first += 2;
+            continue;
+        }
+
         if (strcmp(argv[first], "--cache-timeout") == 0) {
             errno = 0;
             cache_timeout = strtod(value, &end);
@@ -831,7 +1040,11 @@ main(int argc, char **argv)
     /* FUSE supplies the caller's already-masked mode for creations. */
     umask(0);
     argv[first + 1] = argv[0];
-    result = fuse_main(argc - first - 1, argv + first + 1, &operations, NULL);
+    if (worker_count == 0) {
+        result = fuse_main(argc - first - 1, argv + first + 1, &operations, NULL);
+    } else {
+        result = bounded_main(argc - first - 1, argv + first + 1);
+    }
 
 done:
     if (memory_fd >= 0) {

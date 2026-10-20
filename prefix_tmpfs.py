@@ -16,6 +16,38 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CACHE_TIMEOUT = 1
+DEFAULT_THREADS = 4
+MAX_THREADS = 64
+
+
+def validate_threads(value):
+    message = "threads must be an integer from 0 to 64 (0 selects the dynamic pool)"
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(message)
+    try:
+        count = int(value)
+    except ValueError:
+        raise ValueError(message) from None
+    if not 0 <= count <= MAX_THREADS:
+        raise ValueError(message)
+    return count
+
+
+def resolve_threads(threads=None, single_thread=None):
+    if threads is not None:
+        if single_thread is not None:
+            raise ValueError("threads and single_thread cannot both be specified")
+        return validate_threads(threads)
+    if single_thread is not None:
+        return 1 if single_thread else 0
+    return DEFAULT_THREADS
+
+
+def parse_threads(value):
+    try:
+        return validate_threads(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def validate_cache_timeout(value):
@@ -112,10 +144,11 @@ def stop(process, group=False):
 
 class PrefixMount:
     def __init__(self, source, parent, binary, prefixes=None,
-                 cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=True):
+                 cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=None, threads=None):
         self.prefixes = validate_prefixes(prefixes)
         self.cache_timeout = validate_cache_timeout(cache_timeout)
-        self.single_thread = single_thread
+        self.threads = resolve_threads(threads, single_thread)
+        self.single_thread = self.threads == 1
         self.source = Path(source).resolve(strict=True)
         parent = Path(parent).resolve(strict=True)
         if not self.source.is_dir() or not parent.is_dir():
@@ -143,9 +176,11 @@ class PrefixMount:
         options = [value for prefix in self.prefixes for value in ("--prefix", prefix)]
         if self.cache_timeout:
             options.extend(("--cache-timeout", str(self.cache_timeout)))
-        # Small local operations cost less than libfuse's worker scheduling
-        # and shared-queue contention under parallel load.
-        fuse_options = ["-f", "-s"] if self.single_thread else ["-f"]
+        # Keep the native single/dynamic invocation compatible with older
+        # helpers, including binaries supplied to the benchmark as baselines.
+        if self.threads > 1:
+            options.extend(("--threads", str(self.threads)))
+        fuse_options = ["-f", "-s"] if self.threads == 1 else ["-f"]
         with self.log.open("wb") as output:
             self.daemon = subprocess.Popen(
                 [str(self.binary), *options, str(self.source),
@@ -179,7 +214,14 @@ class PrefixMount:
             # would delete the caller's original files.
             raise RuntimeError("cannot unmount " + str(self.view)
                                + "; retained daemon and temporary directory")
-        stop(self.daemon)
+        if self.daemon is not None:
+            try:
+                # Unmount wakes every receiver with EOF. Give the pool time
+                # to join its workers and finish libfuse cleanup before
+                # falling back to termination of an unresponsive daemon.
+                self.daemon.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                stop(self.daemon)
         if self.base.exists():
             if preserve:
                 print("prefix-tmpfs: retained diagnostics at " + str(self.base),
@@ -189,8 +231,9 @@ class PrefixMount:
 
 
 def run(source, parent, command, preload=None, prefixes=None,
-        cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=True):
+        cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=None, threads=None):
     prefixes = validate_prefixes(prefixes)
+    threads = resolve_threads(threads, single_thread)
     for tool in ("bwrap", "fusermount3", "pkg-config"):
         if shutil.which(tool) is None:
             raise RuntimeError("prefix-tmpfs requires " + tool)
@@ -198,7 +241,7 @@ def run(source, parent, command, preload=None, prefixes=None,
         raise RuntimeError("prefix-tmpfs requires access to /dev/fuse")
 
     mount = PrefixMount(source, parent, build_binary(), prefixes, cache_timeout,
-                        single_thread=single_thread)
+                        threads=threads)
     child = None
     status = None
     try:
@@ -232,11 +275,14 @@ def main():
                              "(or use PREFIX_TMPFS_PREFIXES)")
     parser.add_argument("--preload")
     threading = parser.add_mutually_exclusive_group()
-    threading.add_argument("--single-thread", dest="single_thread", action="store_true",
-                           help="serve filesystem requests in one thread (default)")
-    threading.add_argument("--multi-thread", dest="single_thread", action="store_false",
-                           help="use libfuse's dynamic worker pool")
-    parser.set_defaults(single_thread=None)
+    threading.add_argument("--threads", type=parse_threads, metavar="COUNT",
+                           help="fixed request workers (default: PREFIX_TMPFS_THREADS or 4); "
+                                "0 selects libfuse's dynamic pool")
+    threading.add_argument("--single-thread", dest="threads", action="store_const", const=1,
+                           help="serve filesystem requests in one thread")
+    threading.add_argument("--multi-thread", dest="threads", action="store_const", const=0,
+                           help="use libfuse's original dynamic worker pool")
+    parser.set_defaults(threads=None)
     parser.add_argument("--cache-timeout", type=validate_cache_timeout,
                         default=os.environ.get("PREFIX_TMPFS_CACHE_TIMEOUT",
                                                str(DEFAULT_CACHE_TIMEOUT)),
@@ -245,11 +291,19 @@ def main():
                              "seconds (default: PREFIX_TMPFS_CACHE_TIMEOUT or 1)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if args.single_thread is None:
-        setting = os.environ.get("PREFIX_TMPFS_SINGLE_THREAD", "1")
-        if setting not in ("0", "1"):
-            parser.error("PREFIX_TMPFS_SINGLE_THREAD must be 0 or 1")
-        args.single_thread = setting == "1"
+    if args.threads is None:
+        if "PREFIX_TMPFS_THREADS" in os.environ:
+            try:
+                args.threads = validate_threads(os.environ["PREFIX_TMPFS_THREADS"])
+            except ValueError as error:
+                parser.error("PREFIX_TMPFS_THREADS: " + str(error))
+        elif "PREFIX_TMPFS_SINGLE_THREAD" in os.environ:
+            setting = os.environ["PREFIX_TMPFS_SINGLE_THREAD"]
+            if setting not in ("0", "1"):
+                parser.error("PREFIX_TMPFS_SINGLE_THREAD must be 0 or 1")
+            args.threads = 1 if setting == "1" else 0
+        else:
+            args.threads = DEFAULT_THREADS
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
@@ -274,7 +328,7 @@ def main():
 
     try:
         return run(args.source, args.tmpdir, command, args.preload, prefixes,
-                   args.cache_timeout, single_thread=args.single_thread)
+                   args.cache_timeout, threads=args.threads)
     except InterruptedError as error:
         return 128 + error.args[0]
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:

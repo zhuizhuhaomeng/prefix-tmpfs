@@ -76,15 +76,18 @@ def main():
             source = Path(directory).resolve()
             with tempfile.TemporaryDirectory(dir=args.tmpdir) as directory:
                 cases = [("disk", source, None), ("tmpfs", Path(directory), None)]
-                configurations = [("FUSE single cache=0", binary, 0, True),
-                                  ("FUSE single cache=1s", binary, 1, True),
-                                  ("FUSE multi cache=1s", binary, 1, False)]
+                configurations = [("FUSE 1 cache=1s", binary, 1, 1),
+                                  ("FUSE 2 cache=1s", binary, 1, 2),
+                                  ("FUSE 4 cache=1s", binary, 1, 4),
+                                  ("FUSE 8 cache=1s", binary, 1, 8),
+                                  ("FUSE dynamic cache=1s", binary, 1, 0),
+                                  ("FUSE 4 cache=0", binary, 0, 4)]
                 if args.baseline_binary:
                     configurations.insert(0, ("FUSE previous", args.baseline_binary.resolve(),
-                                              0, False))
-                for label, helper, timeout, single_thread in configurations:
+                                              0, 0))
+                for label, helper, timeout, threads in configurations:
                     mount = fs.PrefixMount(source, args.tmpdir, helper, ["cache_"],
-                                           cache_timeout=timeout, single_thread=single_thread)
+                                           cache_timeout=timeout, threads=threads)
                     mounts.append(mount)
                     mount.start()
                     cases.append((label, mount.view, mount))
