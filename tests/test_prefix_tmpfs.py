@@ -43,13 +43,20 @@ class PrefixConfiguration(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("--cache-timeout", result.stderr)
 
-        for options, expected in (([], 0.25), (["--cache-timeout", "1"], 1)):
+        cases = ((None, [], 1), ("0", [], 0), ("0.25", [], 0.25),
+                 ("0.25", ["--cache-timeout", "1"], 1),
+                 ("1", ["--cache-timeout", "0"], 0))
+        for setting, options, expected in cases:
             arguments = [str(SCRIPT), "--source", "/tmp", "--prefix", "tmp_",
                          *options, "--", "true"]
-            with patch.dict(os.environ, {"PREFIX_TMPFS_CACHE_TIMEOUT": "0.25"}), \
+            with patch.dict(os.environ), \
                     patch.object(sys, "argv", arguments), \
                     patch.object(fs.signal, "signal"), \
                     patch.object(fs, "run", return_value=7) as run:
+                if setting is None:
+                    os.environ.pop("PREFIX_TMPFS_CACHE_TIMEOUT", None)
+                else:
+                    os.environ["PREFIX_TMPFS_CACHE_TIMEOUT"] = setting
                 self.assertEqual(fs.main(), 7)
                 self.assertEqual(run.call_args.args[-1], expected)
 
@@ -119,7 +126,8 @@ class PrefixFilesystem(unittest.TestCase):
         self.memory = self.mount.memory
 
     def test_ordinary_files_and_new_directories_write_through(self):
-        path = self.view / "data/sandbox_nested/file"
+        mount = self.custom_mount(["sandbox"], cache_timeout=0)
+        path = mount.view / "data/sandbox_nested/file"
         path.parent.mkdir(parents=True)
         path.write_text("first")
         original = self.source / "data/sandbox_nested/file"
@@ -132,10 +140,11 @@ class PrefixFilesystem(unittest.TestCase):
         self.assertEqual(original.with_name("renamed").read_text(), "changed")
         renamed.unlink()
         self.assertFalse(original.with_name("renamed").exists())
-        self.assertEqual(list(self.memory.iterdir()), [])
+        self.assertEqual(list(mount.memory.iterdir()), [])
 
     def test_uncached_external_metadata_and_name_changes_are_immediate(self):
-        path = self.view / "ordinary"
+        mount = self.custom_mount(["sandbox"], cache_timeout=0)
+        path = mount.view / "ordinary"
         original = self.source / path.name
         self.assertFalse(path.exists())
         original.write_bytes(b"a")
@@ -146,9 +155,9 @@ class PrefixFilesystem(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         original.rename(self.source / "renamed")
         self.assertFalse(path.exists())
-        self.assertEqual((self.view / "renamed").read_bytes(), b"longer")
+        self.assertEqual((mount.view / "renamed").read_bytes(), b"longer")
         (self.source / "renamed").unlink()
-        self.assertFalse((self.view / "renamed").exists())
+        self.assertFalse((mount.view / "renamed").exists())
 
     def test_cached_metadata_and_in_view_mutations(self):
         mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"],
@@ -195,8 +204,8 @@ class PrefixFilesystem(unittest.TestCase):
         (self.view / "not_sandbox").mkdir()
         self.assertTrue((self.source / "not_sandbox").is_dir())
 
-    def custom_mount(self, prefixes):
-        mount = fs.PrefixMount(self.source, "/tmp", self.binary, prefixes)
+    def custom_mount(self, prefixes, **options):
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, prefixes, **options)
         self.addCleanup(mount.close)
         mount.start()
         return mount

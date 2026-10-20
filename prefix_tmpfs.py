@@ -15,6 +15,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_CACHE_TIMEOUT = 1
 
 
 def validate_cache_timeout(value):
@@ -110,7 +111,8 @@ def stop(process, group=False):
 
 
 class PrefixMount:
-    def __init__(self, source, parent, binary, prefixes=None, cache_timeout=0):
+    def __init__(self, source, parent, binary, prefixes=None,
+                 cache_timeout=DEFAULT_CACHE_TIMEOUT):
         self.prefixes = validate_prefixes(prefixes)
         self.cache_timeout = validate_cache_timeout(cache_timeout)
         self.source = Path(source).resolve(strict=True)
@@ -178,7 +180,8 @@ class PrefixMount:
             shutil.rmtree(self.base)
 
 
-def run(source, parent, command, preload=None, prefixes=None, cache_timeout=0):
+def run(source, parent, command, preload=None, prefixes=None,
+        cache_timeout=DEFAULT_CACHE_TIMEOUT):
     prefixes = validate_prefixes(prefixes)
     for tool in ("bwrap", "fusermount3", "pkg-config"):
         if shutil.which(tool) is None:
@@ -219,10 +222,11 @@ def main():
                              "(or use PREFIX_TMPFS_PREFIXES)")
     parser.add_argument("--preload")
     parser.add_argument("--cache-timeout", type=validate_cache_timeout,
-                        default=os.environ.get("PREFIX_TMPFS_CACHE_TIMEOUT", "0"),
+                        default=os.environ.get("PREFIX_TMPFS_CACHE_TIMEOUT",
+                                               str(DEFAULT_CACHE_TIMEOUT)),
                         metavar="SECONDS",
                         help="cache positive lookups and attributes for this many "
-                             "seconds (default: PREFIX_TMPFS_CACHE_TIMEOUT or 0)")
+                             "seconds (default: PREFIX_TMPFS_CACHE_TIMEOUT or 1)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command

@@ -63,20 +63,20 @@ system enables it; this tool does not change the system's swap policy.
 
 ## Performance
 
-By default, positive lookups and attributes are not cached: edits, renames
-and deletions made through the original source remain immediately visible.
-This is expensive for workloads that repeatedly resolve paths to small files.
-Ordinary directories are streamed; only the merged root needs a snapshot.
+By default, positive lookups and attributes are cached for one second to
+reduce repeated path lookups for small files. Ordinary directories are
+streamed; only the merged root needs a snapshot.
 
-For a test run whose source files are stable, enable a short metadata cache:
+Disable the cache when edits, renames and deletions made through the original
+source must remain immediately visible:
 
 ```sh
-PREFIX_TMPFS_CACHE_TIMEOUT=1 ./prefix-tmpfs \
+PREFIX_TMPFS_CACHE_TIMEOUT=0 ./prefix-tmpfs \
     --source /path/to/tests --prefix cache_ -- command args
 ```
 
 `--cache-timeout SECONDS` overrides the environment variable. The default is
-`0`; values must be finite and non-negative, and fractions are accepted.
+`1` second; values must be finite and non-negative, and fractions are accepted.
 This setting applies to positive directory lookups and file attributes on
 both backends. Missing names are never cached. Writes and namespace changes
 through the mounted view update the kernel normally. Changes through another
