@@ -112,9 +112,10 @@ def stop(process, group=False):
 
 class PrefixMount:
     def __init__(self, source, parent, binary, prefixes=None,
-                 cache_timeout=DEFAULT_CACHE_TIMEOUT):
+                 cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=True):
         self.prefixes = validate_prefixes(prefixes)
         self.cache_timeout = validate_cache_timeout(cache_timeout)
+        self.single_thread = single_thread
         self.source = Path(source).resolve(strict=True)
         parent = Path(parent).resolve(strict=True)
         if not self.source.is_dir() or not parent.is_dir():
@@ -142,11 +143,14 @@ class PrefixMount:
         options = [value for prefix in self.prefixes for value in ("--prefix", prefix)]
         if self.cache_timeout:
             options.extend(("--cache-timeout", str(self.cache_timeout)))
+        # Small local operations cost less than libfuse's worker scheduling
+        # and shared-queue contention under parallel load.
+        fuse_options = ["-f", "-s"] if self.single_thread else ["-f"]
         with self.log.open("wb") as output:
             self.daemon = subprocess.Popen(
                 [str(self.binary), *options, str(self.source),
                  str(self.memory), str(self.view),
-                 "-f", "-o", "default_permissions,fsname=prefix-tmpfs"],
+                 *fuse_options, "-o", "default_permissions,fsname=prefix-tmpfs"],
                 stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                 env=infrastructure_env(), start_new_session=True)
         deadline = time.monotonic() + 10
@@ -185,7 +189,7 @@ class PrefixMount:
 
 
 def run(source, parent, command, preload=None, prefixes=None,
-        cache_timeout=DEFAULT_CACHE_TIMEOUT):
+        cache_timeout=DEFAULT_CACHE_TIMEOUT, single_thread=True):
     prefixes = validate_prefixes(prefixes)
     for tool in ("bwrap", "fusermount3", "pkg-config"):
         if shutil.which(tool) is None:
@@ -193,7 +197,8 @@ def run(source, parent, command, preload=None, prefixes=None,
     if not Path("/dev/fuse").exists():
         raise RuntimeError("prefix-tmpfs requires access to /dev/fuse")
 
-    mount = PrefixMount(source, parent, build_binary(), prefixes, cache_timeout)
+    mount = PrefixMount(source, parent, build_binary(), prefixes, cache_timeout,
+                        single_thread=single_thread)
     child = None
     status = None
     try:
@@ -226,6 +231,12 @@ def main():
                         help="directory-name prefix; repeat for multiple prefixes "
                              "(or use PREFIX_TMPFS_PREFIXES)")
     parser.add_argument("--preload")
+    threading = parser.add_mutually_exclusive_group()
+    threading.add_argument("--single-thread", dest="single_thread", action="store_true",
+                           help="serve filesystem requests in one thread (default)")
+    threading.add_argument("--multi-thread", dest="single_thread", action="store_false",
+                           help="use libfuse's dynamic worker pool")
+    parser.set_defaults(single_thread=None)
     parser.add_argument("--cache-timeout", type=validate_cache_timeout,
                         default=os.environ.get("PREFIX_TMPFS_CACHE_TIMEOUT",
                                                str(DEFAULT_CACHE_TIMEOUT)),
@@ -234,6 +245,11 @@ def main():
                              "seconds (default: PREFIX_TMPFS_CACHE_TIMEOUT or 1)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.single_thread is None:
+        setting = os.environ.get("PREFIX_TMPFS_SINGLE_THREAD", "1")
+        if setting not in ("0", "1"):
+            parser.error("PREFIX_TMPFS_SINGLE_THREAD must be 0 or 1")
+        args.single_thread = setting == "1"
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
@@ -258,7 +274,7 @@ def main():
 
     try:
         return run(args.source, args.tmpdir, command, args.preload, prefixes,
-                   args.cache_timeout)
+                   args.cache_timeout, single_thread=args.single_thread)
     except InterruptedError as error:
         return 128 + error.args[0]
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:

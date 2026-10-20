@@ -19,13 +19,43 @@ import unittest
 from unittest.mock import patch
 
 
-SCRIPT = Path(__file__).resolve().parent.parent / "prefix-tmpfs"
+SCRIPT = Path(__file__).resolve().parent.parent / "prefix_tmpfs.py"
 SPEC = importlib.util.spec_from_file_location("prefix_tmpfs", SCRIPT.with_name("prefix_tmpfs.py"))
 fs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fs)
 
 
 class PrefixConfiguration(unittest.TestCase):
+    def test_cli_threading_configuration(self):
+        cases = ((None, [], True), ("1", [], True), ("0", [], False),
+                 ("0", ["--single-thread"], True),
+                 ("1", ["--multi-thread"], False),
+                 ("invalid", ["--single-thread"], True))
+        for setting, options, expected in cases:
+            with self.subTest(setting=setting, options=options), \
+                    patch.dict(os.environ), \
+                    patch.object(sys, "argv", [str(SCRIPT), "--source", "/tmp",
+                                               "--prefix", "tmp_", *options,
+                                               "--", "true"]), \
+                    patch.object(fs.signal, "signal"), \
+                    patch.object(fs, "run", return_value=7) as run:
+                if setting is None:
+                    os.environ.pop("PREFIX_TMPFS_SINGLE_THREAD", None)
+                else:
+                    os.environ["PREFIX_TMPFS_SINGLE_THREAD"] = setting
+                self.assertEqual(fs.main(), 7)
+                self.assertIs(run.call_args.kwargs["single_thread"], expected)
+
+    def test_invalid_threading_configuration_does_not_run_command(self):
+        for value in ("", "2", "false", "bad"):
+            with self.subTest(value=value):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--source", "/tmp", "--prefix", "tmp_",
+                     "--", "true"], env={**os.environ, "PREFIX_TMPFS_SINGLE_THREAD": value},
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("PREFIX_TMPFS_SINGLE_THREAD must be 0 or 1", result.stderr)
+
     def test_cache_timeout_validation(self):
         for value, expected in ((0, 0), ("0", 0), ("0.25", 0.25), (1, 1)):
             self.assertEqual(fs.validate_cache_timeout(value), expected)
@@ -478,18 +508,28 @@ for name in ('cache_run', 'scratch_run', 'sandbox_run'):
         path.unlink()
 
     def test_parallel_independent_roots(self):
-        def worker(index):
-            root = self.view / ("sandbox_" + str(index))
-            root.mkdir()
-            for number in range(20):
-                path = root / str(number)
-                path.write_text(str(index))
-                self.assertEqual(path.read_text(), str(index))
-                path.rename(root / ("renamed-" + str(number)))
-            shutil.rmtree(root)
+        for single_thread in (True, False):
+            with self.subTest(single_thread=single_thread):
+                mount = self.custom_mount(["sandbox"], single_thread=single_thread)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            list(pool.map(worker, range(16)))
+                def worker(index):
+                    root = mount.view / ("sandbox_" + str(index))
+                    root.mkdir()
+                    for number in range(20):
+                        path = root / str(number)
+                        path.write_text(str(index))
+                        self.assertEqual(path.read_text(), str(index))
+                        path.rename(root / ("renamed-" + str(number)))
+                    shutil.rmtree(root)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(worker, range(16)))
+                threads = len(list(Path(f"/proc/{mount.daemon.pid}/task").iterdir()))
+                if single_thread:
+                    self.assertEqual(threads, 1)
+                else:
+                    self.assertGreater(threads, 1)
+                self.assertEqual(list(mount.memory.iterdir()), [])
         self.assertEqual(list(self.memory.iterdir()), [])
         self.assertEqual(list(self.source.iterdir()), [])
 

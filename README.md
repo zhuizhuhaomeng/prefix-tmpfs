@@ -73,6 +73,25 @@ system enables it; this tool does not change the system's swap policy.
 
 ## Performance
 
+The launcher defaults to a single FUSE request thread. Parallel small-file
+workloads can otherwise spend more CPU scheduling libfuse workers and
+contending on their shared request queue than performing tmpfs operations.
+Wrapped commands still run in parallel; only filesystem request handling is
+serialized. This limits the daemon to approximately one CPU core, but does
+not limit the CPU used by the wrapped commands or the rest of the kernel.
+Requests involving slow or blocking backing files can hold up other requests
+in this mode. For those workloads, select the dynamic worker pool with
+`--multi-thread` or `PREFIX_TMPFS_SINGLE_THREAD=0`:
+
+```sh
+PREFIX_TMPFS_SINGLE_THREAD=0 python3 prefix_tmpfs.py \
+    --source /path/to/tests --prefix cache_ -- command args
+```
+
+`--single-thread` and `--multi-thread` override the environment. The environment
+accepts only `0` or `1`, and defaults to `1`. Python callers can select the pool
+with `single_thread=False` in `PrefixMount` or `run`.
+
 By default, positive lookups and attributes are cached for one second to
 reduce repeated path lookups for small files. Ordinary directories are
 streamed; only the merged root needs a snapshot.
@@ -98,6 +117,8 @@ Measure on the filesystem used by your project:
 
 ```sh
 make bench
+# Compare single-thread and multi-thread CPU costs under parallel load:
+python3 benchmarks/small_files.py --workers 16 --cycles 100 --samples 3
 # Optional comparison with a previously built helper:
 python3 benchmarks/small_files.py --baseline-binary /path/to/old/prefix-tmpfs
 ```
@@ -107,9 +128,31 @@ small files. It rotates backend order and reports medians and individual
 samples for disk, native tmpfs and FUSE with/without caching. Build, mount and
 namespace setup time are excluded; these are not end-to-end application times.
 Fixtures use `build/benchmarks/` on the project filesystem and `/tmp` by default.
+The benchmark reports daemon CPU seconds and average CPU utilization alongside
+elapsed time. `--workers` starts independent client processes, and `--cycles`
+is the number of directories per worker. CPU measurements cover the daemon,
+not the client processes; CPU tick resolution can affect very short samples.
+Parallel runs use separate creation/readback and deletion phases. Serial runs
+retain the mixed create/read/delete workload. Samples use fresh directory
+names so old dentries do not carry over between rounds.
 
-One local run on Linux 5.14 / libfuse 3.10.2, with 200 directories, five 1 KiB
-files per directory and five samples, measured:
+On Linux 5.14 / libfuse 3.10.2, the 16-worker command above measured these
+medians with other tests running on the same host:
+
+| Request handling (cache = 1 second) | Elapsed seconds | Daemon CPU seconds | Average daemon CPU |
+| --- | ---: | ---: | ---: |
+| Single thread | 1.4754 | 1.450 | 98% |
+| Dynamic worker pool | 3.8602 | 11.150 | 289% |
+
+These numbers describe this workload, not a general throughput guarantee.
+The mixed parallel create/read/delete stress probe also exposed an unresolved
+cleanup race in the dynamic worker pool: `.fuse_hidden` files sometimes remain
+and cause `rmdir` to return `ENOTEMPTY`. The phased benchmark avoids overlapping
+close and unlink; it does not demonstrate that this cleanup race is fixed.
+
+An earlier local run using the dynamic worker pool on Linux 5.14 / libfuse
+3.10.2, with one client, 200 directories, five 1 KiB files per directory and
+five samples, measured:
 
 | Backend | Median seconds |
 | --- | ---: |
