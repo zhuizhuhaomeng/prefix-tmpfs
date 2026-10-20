@@ -159,7 +159,7 @@ class PrefixMount:
             time.sleep(0.05)
         raise RuntimeError("timed out mounting prefix-tmpfs: " + str(self.view))
 
-    def close(self):
+    def close(self, preserve=False):
         if is_mounted(self.view):
             for option in ("-u", "-uz"):
                 try:
@@ -177,7 +177,11 @@ class PrefixMount:
                                + "; retained daemon and temporary directory")
         stop(self.daemon)
         if self.base.exists():
-            shutil.rmtree(self.base)
+            if preserve:
+                print("prefix-tmpfs: retained diagnostics at " + str(self.base),
+                      file=sys.stderr, flush=True)
+            else:
+                shutil.rmtree(self.base)
 
 
 def run(source, parent, command, preload=None, prefixes=None,
@@ -191,6 +195,7 @@ def run(source, parent, command, preload=None, prefixes=None,
 
     mount = PrefixMount(source, parent, build_binary(), prefixes, cache_timeout)
     child = None
+    status = None
     try:
         mount.start()
         patterns = ", ".join(prefix + "*" for prefix in prefixes)
@@ -210,7 +215,7 @@ def run(source, parent, command, preload=None, prefixes=None,
         try:
             stop(child, group=True)
         finally:
-            mount.close()
+            mount.close(preserve=status != 0)
 
 
 def main():

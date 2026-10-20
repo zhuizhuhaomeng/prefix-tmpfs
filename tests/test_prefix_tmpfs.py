@@ -368,6 +368,10 @@ for name in ('cache_run', 'scratch_run', 'sandbox_run'):
             self.assertEqual(stat.S_IMODE(os.fstat(fd).st_mode), 0o640)
         finally:
             os.close(fd)
+        # FUSE release can finish after close(2) returns. Unmount before
+        # checking that retained data contains no hidden unlinked files.
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.mount.close(preserve=True)
         self.assertEqual(os.listdir(self.memory / root.name), [])
         self.assertFalse(any(path.name.startswith(".fuse_hidden")
                              for path in self.source.iterdir()))
@@ -507,14 +511,69 @@ assert os.environ['LD_PRELOAD'] == 'libm.so.6'
         # The source pathname in this outer namespace was never covered.
         self.assertFalse(fs.is_mounted(self.source))
 
-    def test_command_failure_cleans_the_mount(self):
+    def test_command_failure_retains_data_and_log_after_unmount(self):
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"])
+        self.addCleanup(mount.close)
+        code = '''from pathlib import Path
+import sys
+root = Path(sys.argv[1]) / 'sandbox_failed'
+(root / 'logs').mkdir(parents=True)
+(root / 'logs/error.log').write_text('failure diagnostics')
+sys.exit(7)
+'''
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            status = fs.run(self.source, "/tmp", [sys.executable, "-c", "exit(7)"], prefixes=["sandbox"])
+        errors = io.StringIO()
+        with patch.object(fs, "PrefixMount", return_value=mount), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            status = fs.run(self.source, "/tmp",
+                            [sys.executable, "-c", code, str(self.source)],
+                            prefixes=["sandbox"])
         self.assertEqual(status, 7)
-        base = Path(output.getvalue().strip().split(" -> ")[-1]).parent
-        self.assertFalse(fs.is_mounted(base / "view"))
-        self.assertFalse(base.exists())
+        self.assertFalse(fs.is_mounted(mount.view))
+        self.assertIsNotNone(mount.daemon.poll())
+        self.assertEqual((mount.memory / "sandbox_failed/logs/error.log").read_text(),
+                         "failure diagnostics")
+        self.assertTrue(mount.log.is_file())
+        self.assertIn("retained diagnostics at " + str(mount.base), errors.getvalue())
+        self.assertFalse((self.source / "sandbox_failed").exists())
+
+    def test_successful_command_removes_temporary_data(self):
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"])
+        self.addCleanup(mount.close)
+        code = '''from pathlib import Path
+import sys
+root = Path(sys.argv[1]) / 'sandbox_success'
+root.mkdir()
+(root / 'file').write_text('temporary')
+'''
+        errors = io.StringIO()
+        with patch.object(fs, "PrefixMount", return_value=mount), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
+            status = fs.run(self.source, "/tmp",
+                            [sys.executable, "-c", code, str(self.source)],
+                            prefixes=["sandbox"])
+        self.assertEqual(status, 0)
+        self.assertFalse(fs.is_mounted(mount.view))
+        self.assertIsNotNone(mount.daemon.poll())
+        self.assertFalse(mount.base.exists())
+        self.assertNotIn("retained diagnostics", errors.getvalue())
+
+    def test_mount_failure_retains_the_daemon_log(self):
+        helper = self.mount.base / "failed-helper"
+        helper.write_text("#!/bin/sh\necho 'mount failure diagnostics' >&2\nexit 1\n")
+        helper.chmod(0o755)
+        mount = fs.PrefixMount(self.source, "/tmp", helper, ["sandbox"])
+        self.addCleanup(mount.close)
+        errors = io.StringIO()
+        with patch.object(fs, "PrefixMount", return_value=mount), \
+                contextlib.redirect_stderr(errors):
+            with self.assertRaisesRegex(RuntimeError, "mount failure diagnostics"):
+                fs.run(self.source, "/tmp", [sys.executable, "-c", "exit(0)"],
+                       prefixes=["sandbox"])
+        self.assertFalse(fs.is_mounted(mount.view))
+        self.assertIsNotNone(mount.daemon.poll())
+        self.assertEqual(mount.log.read_text(), "mount failure diagnostics\n")
+        self.assertIn("retained diagnostics at " + str(mount.base), errors.getvalue())
 
     def test_failed_unmount_never_removes_original_files(self):
         marker = self.source / "keep"
@@ -537,11 +596,18 @@ assert os.environ['LD_PRELOAD'] == 'libm.so.6'
         self.assertFalse(self.mount.base.exists())
         self.assertEqual(marker.read_text(), "original data")
 
-    def test_termination_cleans_the_mount(self):
-        code = 'import time; print("CHILD_READY", flush=True); time.sleep(60)'
+    def test_termination_unmounts_and_retains_diagnostics(self):
+        code = '''import sys, time
+from pathlib import Path
+root = Path(sys.argv[1]) / 'sandbox_interrupted'
+root.mkdir()
+(root / 'diagnostics').write_text('interrupted command')
+print('CHILD_READY', flush=True)
+time.sleep(60)
+'''
         child = subprocess.Popen(
             [sys.executable, str(SCRIPT), "--source", str(self.source), "--prefix", "sandbox", "--",
-             sys.executable, "-c", code], stdout=subprocess.PIPE,
+             sys.executable, "-c", code, str(self.source)], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         self.addCleanup(fs.stop, child)
         self.addCleanup(child.stdout.close)
@@ -549,11 +615,15 @@ assert os.environ['LD_PRELOAD'] == 'libm.so.6'
         line = child.stdout.readline()
         self.assertTrue(line.startswith("prefix-tmpfs: "), line)
         base = Path(line.strip().split(" -> ")[-1]).parent
+        self.addCleanup(lambda: shutil.rmtree(base) if base.exists()
+                        and not fs.is_mounted(base / "view") else None)
         self.assertEqual(child.stdout.readline().strip(), "CHILD_READY")
         child.terminate()
         self.assertEqual(child.wait(timeout=10), 143, child.stderr.read())
         self.assertFalse(fs.is_mounted(base / "view"))
-        self.assertFalse(base.exists())
+        self.assertEqual((base / "memory/sandbox_interrupted/diagnostics").read_text(),
+                         "interrupted command")
+        self.assertTrue((base / "fuse.log").is_file())
 
 
 

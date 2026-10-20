@@ -52,10 +52,20 @@ Other terminals and editors retain the original view. Each invocation gets
 an independent backing directory, even when invocations share a source.
 
 The launcher stops the command's PID namespace, unmounts the FUSE view and
-removes temporary data on completion, failure or interruption. If unmounting
-fails, it preserves the daemon and temporary directory rather than traversing
-the live passthrough mount during cleanup. A forced `SIGKILL` of the launcher
-cannot run its cleanup handler.
+stops the filesystem daemon. Successful commands remove their temporary data.
+Failed or interrupted commands retain the backing directory and print its
+location to stderr. Startup failures also retain the directory and daemon log.
+Inspect `memory/` for files still present when the command stopped and
+`fuse.log` for filesystem diagnostics, then remove that exact retained directory
+when it is no longer needed. Subsequent invocations use fresh directories.
+
+Retention cannot recover files that the wrapped program deleted itself. For
+example, Test::Nginx's normal non-randomized mode leaves its server root for
+inspection, while randomized mode removes its server root on exit.
+
+If unmounting fails, the launcher preserves the daemon and temporary directory
+rather than traversing the live passthrough mount during cleanup. A forced
+`SIGKILL` of the launcher cannot run its cleanup handler.
 
 This reduces writes to the original filesystem, but FUSE adds userspace
 round trips and can be slower for small files. Tmpfs may use swap if the
