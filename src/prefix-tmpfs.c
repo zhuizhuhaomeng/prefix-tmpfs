@@ -616,9 +616,17 @@ static int
 sfs_getxattr(const char *path, const char *name, char *value, size_t size)
 {
     char full[PATH_MAX + 64];
-    int result = xattr_path(path, full, sizeof(full));
+    int result;
     ssize_t n;
 
+    /* File capabilities are outside this filesystem's workload. Linux
+     * probes this attribute on writes; avoid resolving the backing path
+     * and querying an attribute that is always treated as absent. */
+    if (strcmp(name, "security.capability") == 0) {
+        return -ENODATA;
+    }
+
+    result = xattr_path(path, full, sizeof(full));
     if (result < 0) {
         return result;
     }

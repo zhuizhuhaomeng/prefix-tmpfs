@@ -487,6 +487,60 @@ for name in ('cache_run', 'scratch_run', 'sandbox_run'):
         self.assertIn("user.sandbox-test", os.listxattr(path))
         os.removexattr(path, "user.sandbox-test")
 
+    def test_capability_probe_bypasses_backend_and_other_attributes_pass_through(self):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("requires a C compiler for xattr fault injection")
+        source = self.mount.base / "xattr-probe.c"
+        library = self.mount.base / "xattr-probe.so"
+        source.write_text('''#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    ssize_t (*real_get)(const char *, const char *, void *, size_t);
+    if (strcmp(name, "security.capability") == 0
+        || strcmp(name, "security.capability.extra") == 0
+        || strcmp(name, "security.selinux") == 0
+        || strcmp(name, "system.posix_acl_access") == 0) {
+        errno = EACCES;
+        return -1;
+    }
+    real_get = dlsym(RTLD_NEXT, "lgetxattr");
+    return real_get(path, name, value, size);
+}
+''')
+        subprocess.run([compiler, "-shared", "-fPIC", str(source), "-o", str(library),
+                        "-ldl"], check=True, capture_output=True, timeout=10)
+        mount = fs.PrefixMount(self.source, "/tmp", self.binary, ["sandbox"], threads=4)
+        self.addCleanup(mount.close)
+        original_popen = fs.subprocess.Popen
+
+        def launch(command, **options):
+            options["env"] = {**options["env"], "LD_PRELOAD": str(library)}
+            return original_popen(command, **options)
+
+        with patch.object(fs.subprocess, "Popen", side_effect=launch):
+            mount.start()
+        for relative in ("sandbox_xattrs/file", "disk_xattrs/file"):
+            with self.subTest(path=relative):
+                path = mount.view / relative
+                path.parent.mkdir()
+                path.write_bytes(b"append")
+                with self.assertRaises(OSError) as caught:
+                    os.getxattr(path, "security.capability")
+                self.assertEqual(caught.exception.errno, errno.ENODATA)
+                for name in ("security.capability.extra", "security.selinux",
+                             "system.posix_acl_access"):
+                    with self.assertRaises(OSError) as caught:
+                        os.getxattr(path, name)
+                    self.assertEqual(caught.exception.errno, errno.EACCES)
+                os.setxattr(path, "user.prefix-test", b"value")
+                self.assertEqual(os.getxattr(path, "user.prefix-test"), b"value")
+                self.assertIn("user.prefix-test", os.listxattr(path))
+                os.removexattr(path, "user.prefix-test")
+
     def test_links_and_cross_backend_renames(self):
         root = self.view / "sandbox_4"
         root.mkdir()
